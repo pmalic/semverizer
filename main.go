@@ -12,6 +12,7 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/heroku/docker-registry-client/registry"
+	"golang.org/x/net/idna"
 )
 
 const defaultListenPort = 8080
@@ -87,6 +88,25 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hostParts := strings.Split(strings.TrimSuffix(strings.Split(r.Host, ":")[0], domain), ".")
+
+	if len(hostParts) == 1 && strings.HasPrefix(hostParts[0], "xn--") {
+
+		host, err := idna.ToUnicode(hostParts[0])
+		if err != nil {
+			w.WriteHeader(400)
+			w.Write([]byte("400 Bad Request"))
+			return
+		}
+
+		host = strings.Map(func(r rune) rune {
+			if (r >= 0x41 && r <= 0x5a) || (r >= 0x61 && r <= 0x7a) || (r >= 0x30 && r <= 0x39) || r == 0x2d {
+				return r
+			}
+			return 0x2e
+		}, host)
+
+		hostParts = strings.Split(host, ".")
+	}
 
 	var hasSchemeInHost bool
 	var scheme string
