@@ -1,17 +1,19 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/Masterminds/semver/v3"
-	"github.com/heroku/docker-registry-client/registry"
 	"golang.org/x/net/idna"
 )
 
@@ -19,6 +21,8 @@ const defaultListenPort = 8080
 
 var (
 	domain string
+
+	insecure bool
 
 	semVerReplacer = strings.NewReplacer("_lt_", "<", "_gt_", ">", "_lte_", "<=", "_gte_", ">=", "_eq_", "=", "_ne_", "!=", "_a_", "*", "_t_", "~", "_c_", "^")
 )
@@ -30,27 +34,68 @@ func init() {
 	if domain == "." {
 		domain = ".semverizer.io"
 	}
+
+	_, insecure = os.LookupEnv("INSECURE")
 }
 
-func findTag(redirectURIBase string, insecure bool, image string, constraint *semver.Constraints) (string, error) {
+type authzRoundTripper struct {
+	authz string
+	rt    http.RoundTripper
+}
 
-	var reg *registry.Registry
-	var err error
+func (art authzRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	r.Header.Add("Authorization", art.authz)
+	return art.rt.RoundTrip(r)
+}
 
-	switch insecure {
-	case false:
-		reg, err = registry.New(redirectURIBase, "", "")
-	case true:
-		reg, err = registry.NewInsecure(redirectURIBase, "", "")
-	}
+type tagsListResp struct {
+	Tags []string `json:"tags"`
+}
 
-	if err != nil {
-		return "", err
-	}
+func findTag(registryURL *url.URL, authz string, image string, constraint *semver.Constraints) (string, error) {
 
-	tags, err := reg.Tags(image)
-	if err != nil {
-		return "", err
+	var tags []string
+
+	client := &http.Client{Transport: authzRoundTripper{authz: authz, rt: http.DefaultTransport}}
+	url := registryURL.String() + "/v2/" + image + "/tags/list?n=1000"
+
+	for {
+		rqst, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return "", err
+		}
+
+		resp, err := client.Do(rqst)
+		if err != nil {
+			return "", err
+		}
+
+		if resp.StatusCode != 200 {
+			return "", errors.New("fetching tags failed: " + resp.Status)
+		}
+
+		defer resp.Body.Close()
+		jsonDecoder := json.NewDecoder(resp.Body)
+
+		var tagsListResp tagsListResp
+
+		err = jsonDecoder.Decode(&tagsListResp)
+		if err != nil {
+			return "", err
+		}
+
+		tags = append(tags, tagsListResp.Tags...)
+
+		url = resp.Header.Get("Link")
+		if url == "" {
+			break
+		}
+
+		url = strings.Trim(strings.Split(url, ";")[0], "<> ")
+
+		if !strings.HasPrefix(url, "http") {
+			url = registryURL.String() + url
+		}
 	}
 
 	vers := make([]*semver.Version, 0, len(tags))
@@ -72,7 +117,7 @@ func findTag(redirectURIBase string, insecure bool, image string, constraint *se
 		ver := vers[i]
 
 		if constraint.Check(ver) {
-			return ver.String(), nil
+			return ver.Original(), nil
 		}
 	}
 
@@ -80,12 +125,11 @@ func findTag(redirectURIBase string, insecure bool, image string, constraint *se
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(404)
+	w.Write([]byte("404 Not Found"))
+}
 
-	if !strings.HasPrefix(r.URL.Path, "/v2/") {
-		w.WriteHeader(404)
-		w.Write([]byte("404 Not Found"))
-		return
-	}
+func v2Handler(w http.ResponseWriter, r *http.Request) {
 
 	hostParts := strings.Split(strings.TrimSuffix(strings.Split(r.Host, ":")[0], domain), ".")
 
@@ -149,8 +193,12 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 
 	host := strings.Join(hostParts, ".")
 
-	redirectURIBase := scheme + "://" + host
-	redirectURI := redirectURIBase + r.URL.RequestURI()
+	registryURL, err := url.Parse(scheme + "://" + host)
+	if err != nil {
+		w.WriteHeader(400)
+		w.Write([]byte("400 Bad Request"))
+		return
+	}
 
 	pathParts := strings.Split(r.URL.Path, "/")
 	pathPartsLen := len(pathParts)
@@ -164,27 +212,30 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 		log.Print("DEBUG: SemVer manifest request for " + fullRef)
 
 		constraint, err := semver.NewConstraint(tag)
-
 		if err != nil {
-			log.Print("WARNING: could not create a SemVer constraint from " + tag)
+			log.Print("WARNING: could not create a SemVer constraint from tag " + tag)
 		} else {
-			tag, err := findTag(redirectURIBase, scheme == "http", image, constraint)
-
+			tag, err := findTag(registryURL, r.Header.Get("Authorization"), image, constraint)
 			if err != nil {
 				log.Print("ERROR: finding tag for "+fullRef+" failed: ", err)
 			} else {
 				log.Print("DEBUG: found tag " + tag + " for " + fullRef)
 
 				pathParts[pathPartsLen-1] = tag
-				redirectURI = redirectURIBase + strings.Join(pathParts, "/")
+				r.URL.Path = strings.Join(pathParts, "/")
 			}
 		}
 	}
 
-	log.Print("DEBUG: redirecting to " + redirectURI)
+	r.URL.Host = registryURL.Host
+	r.URL.Scheme = registryURL.Scheme
+	r.Host = registryURL.Host
 
-	w.Header().Set("Content-Type", "")
-	http.Redirect(w, r, redirectURI, 302)
+	log.Print("DEBUG: proxying to " + r.URL.String())
+
+	proxy := httputil.NewSingleHostReverseProxy(registryURL)
+
+	proxy.ServeHTTP(w, r)
 }
 
 func main() {
@@ -197,5 +248,7 @@ func main() {
 	log.Printf("INFO: listenting on port %d, domain %s", listenPort, domain[1:])
 
 	http.HandleFunc("/", rootHandler)
+	http.HandleFunc("/v2/", v2Handler)
+
 	log.Fatal(http.ListenAndServe(":"+strconv.Itoa(listenPort), nil))
 }
